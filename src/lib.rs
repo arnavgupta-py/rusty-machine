@@ -5,7 +5,7 @@ use pyo3::types::PyModule;
 use std::os::raw::c_int;
 use cust::memory::DeviceMemory;
 
-/// FFI bindings module.
+/// FFI bindings module for libcusolver.so
 mod ffi {
     use super::c_int;
     
@@ -88,66 +88,59 @@ fn gpu_inverse(input: Vec<f32>, n: usize) -> PyResult<Vec<f32>> {
     cust::init(CudaFlags::empty()).map_err(to_py_err)?;
     let device = Device::get_device(0).map_err(to_py_err)?;
     let _context = Context::new(device).map_err(to_py_err)?;
-    
     let mut a_dev = DeviceBuffer::from_slice(&input).map_err(to_py_err)?;
     let mut handle: ffi::CusolverDnHandle = std::ptr::null_mut();
-    
-    // Create identity matrix for inversion
-    let mut identity = vec![0.0f32; n * n];
-    for i in 0..n {
-        identity[i * n + i] = 1.0;
-    }
+    let identity = {
+        let mut id = vec![0.0f32; n * n];
+        for i in 0..n { id[i * n + i] = 1.0; }
+        id
+    };
     let mut b_dev = DeviceBuffer::from_slice(&identity).map_err(to_py_err)?;
-    
     unsafe {
         ffi::cusolverDnCreate(&mut handle);
-        
         let mut ipiv_dev = DeviceBuffer::<c_int>::uninitialized(n).map_err(to_py_err)?;
         let mut info_dev = DeviceBuffer::<c_int>::uninitialized(1).map_err(to_py_err)?;
-        
-        // LU factorization
         let mut lwork: c_int = 0;
-        ffi::cusolverDnSgetrf_bufferSize(
-            handle, 
-            n as c_int, 
-            n as c_int, 
-            a_dev.as_raw_ptr() as *mut f32, 
-            n as c_int, 
-            &mut lwork
-        );
-        
+        ffi::cusolverDnSgetrf_bufferSize(handle, n as c_int, n as c_int, a_dev.as_raw_ptr() as *mut f32, n as c_int, &mut lwork);
         let mut work_dev = DeviceBuffer::<f32>::uninitialized(lwork as usize).map_err(to_py_err)?;
-        ffi::cusolverDnSgetrf(
-            handle, 
-            n as c_int, 
-            n as c_int, 
-            a_dev.as_raw_ptr() as *mut f32, 
-            n as c_int,
-            work_dev.as_raw_ptr() as *mut f32, 
-            ipiv_dev.as_raw_ptr() as *mut c_int, 
-            info_dev.as_raw_ptr() as *mut c_int
-        );
-        
-        // Solve A * X = I to get inverse
-        ffi::cusolverDnSgetrs(
-            handle,
-            0, // No transpose
-            n as c_int,
-            n as c_int, // n right-hand sides
-            a_dev.as_raw_ptr() as *const f32,
-            n as c_int,
-            ipiv_dev.as_raw_ptr() as *const c_int,
-            b_dev.as_raw_ptr() as *mut f32,
-            n as c_int,
-            info_dev.as_raw_ptr() as *mut c_int
-        );
-        
+        ffi::cusolverDnSgetrf(handle, n as c_int, n as c_int, a_dev.as_raw_ptr() as *mut f32, n as c_int, work_dev.as_raw_ptr() as *mut f32, ipiv_dev.as_raw_ptr() as *mut c_int, info_dev.as_raw_ptr() as *mut c_int);
+        ffi::cusolverDnSgetrs(handle, 0, n as c_int, n as c_int, a_dev.as_raw_ptr() as *const f32, n as c_int, ipiv_dev.as_raw_ptr() as *const c_int, b_dev.as_raw_ptr() as *mut f32, n as c_int, info_dev.as_raw_ptr() as *mut c_int);
         ffi::cusolverDnDestroy(handle);
     }
-    
     let mut inv_host = vec![0.0f32; n * n];
     b_dev.copy_to(&mut inv_host).map_err(to_py_err)?;
     Ok(inv_host)
+}
+
+/// Solves the Normal Equation: theta = (X^T * X)^-1 * X^T * y
+#[pyfunction]
+fn solve_normal_equation(x: Vec<f32>, y: Vec<f32>, samples: usize, features: usize) -> PyResult<Vec<f32>> {
+    // This function orchestrates our existing primitives.
+    // Note: This version is clear but not maximally efficient, as data is copied
+    // back to the CPU after each step. A future optimization would be to create
+    // internal-only functions that operate purely on GPU device memory.
+
+    // --- Step 1: Transpose X ---
+    // X is (samples x features) -> x_t is (features x samples)
+    let x_t = gpu_transpose(x.clone(), samples, features)?;
+
+    // --- Step 2: Calculate X^T * X ---
+    // (features x samples) @ (samples x features) -> (features x features)
+    let xtx = gpu_matrix_multiply(x_t.clone(), x, features, samples, features)?;
+
+    // --- Step 3: Invert (X^T * X) ---
+    // (features x features) -> (features x features)
+    let xtx_inv = gpu_inverse(xtx, features)?;
+
+    // --- Step 4: Calculate (X^T * X)^-1 * X^T ---
+    // (features x features) @ (features x samples) -> (features x samples)
+    let intermediate = gpu_matrix_multiply(xtx_inv, x_t, features, features, samples)?;
+
+    // --- Step 5: Calculate final theta = intermediate * y ---
+    // (features x samples) @ (samples x 1) -> (features x 1)
+    let theta = gpu_matrix_multiply(intermediate, y, features, samples, 1)?;
+
+    Ok(theta)
 }
 
 #[pymodule]
@@ -155,5 +148,7 @@ fn rusty_machine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(gpu_matrix_multiply))?;
     m.add_wrapped(wrap_pyfunction!(gpu_transpose))?;
     m.add_wrapped(wrap_pyfunction!(gpu_inverse))?;
+    // ADDED: Expose the new solver function to Python
+    m.add_wrapped(wrap_pyfunction!(solve_normal_equation))?;
     Ok(())
 }
