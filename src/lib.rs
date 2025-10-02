@@ -42,9 +42,15 @@ fn gpu_matrix_multiply(a_ptr: u64, b_ptr: u64, c_ptr: u64, m: usize, n: usize, k
     let module = Module::from_ptx(include_str!("kernels.ptx"), &[]).map_err(to_py_err)?;
     let stream = Stream::new(StreamFlags::DEFAULT, None).map_err(to_py_err)?;
 
-    let a_dev = unsafe { DevicePointer::<f32>::from_raw(a_ptr) };
-    let b_dev = unsafe { DevicePointer::<f32>::from_raw(b_ptr) };
-    let c_dev = unsafe { DevicePointer::<f32>::from_raw(c_ptr) };
+    // The from_raw function itself is unsafe, so it must be called within an unsafe block.
+    // The individual `unsafe` wrappers were redundant.
+    let (a_dev, b_dev, c_dev) = unsafe {
+        (
+            DevicePointer::<f32>::from_raw(a_ptr),
+            DevicePointer::<f32>::from_raw(b_ptr),
+            DevicePointer::<f32>::from_raw(c_ptr),
+        )
+    };
 
     let func = module.get_function("matmul").map_err(to_py_err)?;
     let grid_dims = ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1);
@@ -70,8 +76,12 @@ fn gpu_transpose(in_ptr: u64, out_ptr: u64, m: usize, n: usize) -> PyResult<()> 
     let module = Module::from_ptx(include_str!("kernels.ptx"), &[]).map_err(to_py_err)?;
     let stream = Stream::new(StreamFlags::DEFAULT, None).map_err(to_py_err)?;
 
-    let in_dev = unsafe { DevicePointer::<f32>::from_raw(in_ptr) };
-    let out_dev = unsafe { DevicePointer::<f32>::from_raw(out_ptr) };
+    let (in_dev, out_dev) = unsafe {
+        (
+            DevicePointer::<f32>::from_raw(in_ptr),
+            DevicePointer::<f32>::from_raw(out_ptr),
+        )
+    };
 
     let func = module.get_function("transpose").map_err(to_py_err)?;
     let grid_dims = ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1);
