@@ -112,6 +112,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4c7245a08504955605670dbf141fceab975f15ca21570696aebe9d2e71576bd"
 
 [[package]]
+name = "lbfgs"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44bf19986e8fbf7566eab563e23d68549797cc9d4d63d1a9d63b2e9dfbc15772"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.175"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -263,6 +272,7 @@ name = "rusty_machine"
 version = "0.1.0"
 dependencies = [
  "cust",
+ "lbfgs",
  "pyo3",
 ]
 
