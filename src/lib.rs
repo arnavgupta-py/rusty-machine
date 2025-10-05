@@ -1,269 +1,112 @@
 use cust::prelude::*;
+use cust::memory::{DeviceBuffer, DevicePointer, DeviceSlice, DeviceMemory};
 use pyo3::prelude::*;
-use pyo3::Bound;
-use pyo3::types::PyModule;
+use pyo3::wrap_pyfunction;
+use std::sync::OnceLock;
 use std::os::raw::c_int;
-use cust::memory::{DeviceMemory, DevicePointer, DeviceSlice};
-use lbfgs::Lbfgs;
 
 mod ffi {
     use super::c_int;
-    
     #[repr(C)]
     pub struct CusolverDnContext { _private: [u8; 0] }
     pub type CusolverDnHandle = *mut CusolverDnContext;
-
     #[link(name = "cusolver")]
     extern "C" {
         pub fn cusolverDnCreate(handle: *mut CusolverDnHandle) -> c_int;
         pub fn cusolverDnDestroy(handle: CusolverDnHandle) -> c_int;
-        pub fn cusolverDnSgetrf_bufferSize(
-            handle: CusolverDnHandle, m: c_int, n: c_int, A: *mut f32, lda: c_int, Lwork: *mut c_int
-        ) -> c_int;
-        pub fn cusolverDnSgetrf(
-            handle: CusolverDnHandle, m: c_int, n: c_int, A: *mut f32, lda: c_int,
-            workspace: *mut f32, devIpiv: *mut c_int, devInfo: *mut c_int
-        ) -> c_int;
-        pub fn cusolverDnSgetrs(
-            handle: CusolverDnHandle, trans: c_int, n: c_int, nrhs: c_int,
-            A: *const f32, lda: c_int, devIpiv: *const c_int,
-            B: *mut f32, ldb: c_int, devInfo: *mut c_int
-        ) -> c_int;
+        pub fn cusolverDnSgetrf_bufferSize(handle: CusolverDnHandle, m: c_int, n: c_int, A: *mut f32, lda: c_int, Lwork: *mut c_int) -> c_int;
+        pub fn cusolverDnSgetrf(handle: CusolverDnHandle, m: c_int, n: c_int, A: *mut f32, lda: c_int, workspace: *mut f32, devIpiv: *mut c_int, devInfo: *mut c_int) -> c_int;
+        pub fn cusolverDnSgetrs(handle: CusolverDnHandle, trans: c_int, n: c_int, nrhs: c_int, A: *const f32, lda: c_int, devIpiv: *const c_int, B: *mut f32, ldb: c_int, devInfo: *mut c_int) -> c_int;
     }
 }
 
-struct GpuObjective<'a> {
-    samples: usize,
-    features: usize,
-    x_ptr: u64,
-    y_ptr: u64,
-    module: &'a Module,
-    stream: &'a Stream,
+struct GpuContext {
+    _ctx: Context,
+    stream: Stream,
+    module: Module,
 }
 
-fn objective_function(instance: &mut GpuObjective, x: &[f64], g: &mut [f64]) -> f64 {
-    let theta_f32: Vec<f32> = x.iter().map(|&val| val as f32).collect();
-    let mut grad_f32 = vec![0.0f32; instance.features];
-    let cost;
+static GLOBAL_CTX: OnceLock<GpuContext> = OnceLock::new();
 
-    unsafe {
-        let theta_dev = DeviceBuffer::from_slice(&theta_f32).unwrap();
-        let grad_dev = DeviceBuffer::from_slice(&mut grad_f32).unwrap();
-        let stream = instance.stream;
-
-        let h_dev = DeviceBuffer::<f32>::uninitialized(instance.samples).unwrap();
-        gpu_matrix_multiply(instance.x_ptr, theta_dev.as_raw_ptr() as u64, h_dev.as_raw_ptr() as u64, instance.samples, instance.features, 1).unwrap();
-
-        let sigmoid_func = instance.module.get_function("elementwise_sigmoid").unwrap();
-        let grid_dims = ((instance.samples as u32 + 255) / 256, 1, 1);
-        let block_dims = (256, 1, 1);
-        launch!(sigmoid_func<<<grid_dims, block_dims, 0, stream>>>(h_dev.as_device_ptr(), instance.samples as i32)).unwrap();
-        
-        let error_dev = DeviceBuffer::<f32>::uninitialized(instance.samples).unwrap();
-        let sub_func = instance.module.get_function("elementwise_sub").unwrap();
-        launch!(sub_func<<<grid_dims, block_dims, 0, stream>>>(h_dev.as_device_ptr(), DevicePointer::<f32>::from_raw(instance.y_ptr), error_dev.as_device_ptr(), instance.samples as i32)).unwrap();
-        
-        let x_t_dev = DeviceBuffer::<f32>::uninitialized(instance.features * instance.samples).unwrap();
-        gpu_transpose(instance.x_ptr, x_t_dev.as_raw_ptr() as u64, instance.samples, instance.features).unwrap();
-        
-        gpu_matrix_multiply(x_t_dev.as_raw_ptr() as u64, error_dev.as_raw_ptr() as u64, grad_dev.as_raw_ptr() as u64, instance.features, instance.samples, 1).unwrap();
-        
-        let h_log_dev = h_dev.clone();
-        let one_minus_h_dev = DeviceBuffer::from_slice(&vec![1.0f32; instance.samples]).unwrap();
-        let axpy_func = instance.module.get_function("axpy").unwrap();
-        launch!(axpy_func<<<grid_dims, block_dims, 0, stream>>>(-1.0f32, h_dev.as_device_ptr(), one_minus_h_dev.as_device_ptr(), instance.samples as i32)).unwrap();
-        let log_func = instance.module.get_function("elementwise_log").unwrap();
-        launch!(log_func<<<grid_dims, block_dims, 0, stream>>>(h_log_dev.as_device_ptr(), instance.samples as i32)).unwrap();
-        launch!(log_func<<<grid_dims, block_dims, 0, stream>>>(one_minus_h_dev.as_device_ptr(), instance.samples as i32)).unwrap();
-        
-        let cost_vals_dev = DeviceBuffer::<f32>::uninitialized(instance.samples).unwrap();
-        let cost_kernel_func = instance.module.get_function("cost_kernel").unwrap();
-        launch!(cost_kernel_func<<<grid_dims, block_dims, 0, stream>>>(DevicePointer::<f32>::from_raw(instance.y_ptr), h_log_dev.as_device_ptr(), one_minus_h_dev.as_device_ptr(), cost_vals_dev.as_device_ptr(), instance.samples as i32)).unwrap();
-        let num_blocks = (instance.samples + 255) / 256;
-        let partial_sums_dev = DeviceBuffer::<f32>::uninitialized(num_blocks).unwrap();
-        let sum_reduction_func = instance.module.get_function("sum_reduction").unwrap();
-        launch!(sum_reduction_func<<<grid_dims, block_dims, 0, stream>>>(cost_vals_dev.as_device_ptr(), partial_sums_dev.as_device_ptr(), instance.samples as i32)).unwrap();
-
-        let mut host_sums = vec![0.0f32; num_blocks];
-        stream.synchronize().unwrap();
-        partial_sums_dev.copy_to(&mut host_sums).unwrap();
-        grad_dev.copy_to(&mut grad_f32).unwrap();
-        
-        cost = host_sums.iter().sum::<f32>() / instance.samples as f32;
-    }
-
-    for i in 0..instance.features {
-        g[i] = (grad_f32[i] / instance.samples as f32) as f64;
-    }
-    cost as f64
+fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
-#[pyfunction]
-fn train_logistic_lbfgs(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples: usize, features: usize, max_iter: usize, _tol: f32) -> PyResult<()> {
-    let to_py_err = |e: cust::error::CudaError| pyo3::exceptions::PyRuntimeError::new_err(e.to_string());
-    
-    cust::init(CudaFlags::empty()).map_err(to_py_err)?;
-    let device = Device::get_device(0).map_err(to_py_err)?;
-    let _context = Context::new(device).map_err(to_py_err)?;
-    let module = Module::from_ptx(include_str!("kernels.ptx"), &[]).map_err(to_py_err)?;
-    let stream = Stream::new(StreamFlags::DEFAULT, None).map_err(to_py_err)?;
-
-    let mut objective = GpuObjective {
-        samples, features, x_ptr, y_ptr,
-        module: &module, stream: &stream,
-    };
-
-    let mut x = vec![0.0f64; features];
-    let mut lbfgs = Lbfgs::new(features, 10);
-    let mut prev_x = x.clone();
-    let mut prev_gx = vec![0.0f64; features];
-    
-    for iteration in 0..max_iter {
-        let mut gx = vec![0.0f64; features];
-        let fx = objective_function(&mut objective, &x, &mut gx);
-
-        let grad_norm: f64 = gx.iter().map(|g| g * g).sum::<f64>().sqrt();
-        if grad_norm < 1e-5 {
-            break;
-        }
-        
-        if iteration > 0 {
-            let s: Vec<f64> = x.iter().zip(prev_x.iter()).map(|(a, b)| a - b).collect();
-            let y: Vec<f64> = gx.iter().zip(prev_gx.iter()).map(|(a, b)| a - b).collect();
-            lbfgs.update_hessian(&s, &y);
-        }
-        
-        let mut direction = gx.clone();
-        lbfgs.apply_hessian(&mut direction);
-        
-        for d in direction.iter_mut() {
-            *d = -*d;
-        }
-        
-        let mut step_size = 1.0;
-        let c1 = 1e-4;
-        let grad_dot_dir: f64 = gx.iter().zip(direction.iter()).map(|(g, d)| g * d).sum();
-        
-        prev_x.copy_from_slice(&x);
-        prev_gx.copy_from_slice(&gx);
-        
-        for _ in 0..20 {
-            for i in 0..features {
-                x[i] = prev_x[i] + step_size * direction[i];
-            }
-            
-            let mut dummy_grad = vec![0.0f64; features];
-            let new_fx = objective_function(&mut objective, &x, &mut dummy_grad);
-            
-            if new_fx <= fx + c1 * step_size * grad_dot_dir {
-                break;
-            }
-            step_size *= 0.5;
-        }
+fn get_gpu_context() -> PyResult<&'static GpuContext> {
+    if let Some(ctx) = GLOBAL_CTX.get() {
+        return Ok(ctx);
     }
-    
-    let final_theta_f32: Vec<f32> = x.iter().map(|&val| val as f32).collect();
-
-    unsafe {
-        let final_theta_dev = DeviceBuffer::from_slice(&final_theta_f32).map_err(to_py_err)?;
-        let mut theta_out_slice = DeviceSlice::from_raw_parts_mut(DevicePointer::<f32>::from_raw(theta_ptr), features);
-        final_theta_dev.copy_to(&mut theta_out_slice).map_err(to_py_err)?;
+    let created = (|| -> Result<GpuContext, PyErr> {
+        cust::init(CudaFlags::empty()).map_err(to_py_err)?;
+        let device = Device::get_device(0).map_err(to_py_err)?;
+        let ctx = Context::new(device).map_err(to_py_err)?;
+        let stream = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(to_py_err)?;
+        let module = Module::from_ptx(include_str!("kernels.ptx"), &[]).map_err(to_py_err)?;
+        Ok(GpuContext { _ctx: ctx, stream, module })
+    })();
+    match created {
+        Ok(ctx_val) => {
+            GLOBAL_CTX.set(ctx_val).map_err(|_| to_py_err("Failed to set GLOBAL_CTX"))?;
+            Ok(GLOBAL_CTX.get().expect("GLOBAL_CTX set but not present"))
+        }
+        Err(e) => Err(e),
     }
+}
 
-    stream.synchronize().map_err(to_py_err)?;
-    Ok(())
+fn device_ptr_from_u64(ptr: u64) -> DevicePointer<f32> {
+    DevicePointer::from_raw(ptr)
 }
 
 #[pyfunction]
 fn gpu_matrix_multiply(a_ptr: u64, b_ptr: u64, c_ptr: u64, m: usize, n: usize, k: usize) -> PyResult<()> {
-    let to_py_err = |e: cust::error::CudaError| pyo3::exceptions::PyRuntimeError::new_err(e.to_string());
-    
-    cust::init(CudaFlags::empty()).map_err(to_py_err)?;
-    let device = Device::get_device(0).map_err(to_py_err)?;
-    let _context = Context::new(device).map_err(to_py_err)?;
-    let module = Module::from_ptx(include_str!("kernels.ptx"), &[]).map_err(to_py_err)?;
-    let stream = Stream::new(StreamFlags::DEFAULT, None).map_err(to_py_err)?;
-
-    let func = module.get_function("matmul").map_err(to_py_err)?;
+    let ctx = get_gpu_context()?;
+    let func = ctx.module.get_function("matmul").map_err(to_py_err)?;
     let grid_dims = ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1);
     let block_dims = (16, 16, 1);
-    let stream_ref = &stream;
-
+    let stream = &ctx.stream;
     unsafe {
-        let a_dev = DevicePointer::<f32>::from_raw(a_ptr);
-        let b_dev = DevicePointer::<f32>::from_raw(b_ptr);
-        let c_dev = DevicePointer::<f32>::from_raw(c_ptr);
-
-        launch!(func<<<grid_dims, block_dims, 0, stream_ref>>>(
-            a_dev, b_dev, c_dev,
+        launch!(func<<<grid_dims, block_dims, 0, stream>>>(
+            device_ptr_from_u64(a_ptr), device_ptr_from_u64(b_ptr), device_ptr_from_u64(c_ptr),
             m as i32, n as i32, k as i32
         )).map_err(to_py_err)?;
     }
-    stream.synchronize().map_err(to_py_err)?;
     Ok(())
 }
 
 #[pyfunction]
 fn gpu_transpose(in_ptr: u64, out_ptr: u64, m: usize, n: usize) -> PyResult<()> {
-    let to_py_err = |e: cust::error::CudaError| pyo3::exceptions::PyRuntimeError::new_err(e.to_string());
-
-    cust::init(CudaFlags::empty()).map_err(to_py_err)?;
-    let device = Device::get_device(0).map_err(to_py_err)?;
-    let _context = Context::new(device).map_err(to_py_err)?;
-    let module = Module::from_ptx(include_str!("kernels.ptx"), &[]).map_err(to_py_err)?;
-    let stream = Stream::new(StreamFlags::DEFAULT, None).map_err(to_py_err)?;
-
-    let func = module.get_function("transpose").map_err(to_py_err)?;
+    let ctx = get_gpu_context()?;
+    let func = ctx.module.get_function("transpose").map_err(to_py_err)?;
     let grid_dims = ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1);
     let block_dims = (16, 16, 1);
-    let stream_ref = &stream;
-    
+    let stream = &ctx.stream;
     unsafe {
-        let in_dev = DevicePointer::<f32>::from_raw(in_ptr);
-        let out_dev = DevicePointer::<f32>::from_raw(out_ptr);
-
-        launch!(func<<<grid_dims, block_dims, 0, stream_ref>>>(
-            in_dev, out_dev, m as i32, n as i32
+        launch!(func<<<grid_dims, block_dims, 0, stream>>>(
+            device_ptr_from_u64(in_ptr), device_ptr_from_u64(out_ptr), m as i32, n as i32
         )).map_err(to_py_err)?;
     }
-    stream.synchronize().map_err(to_py_err)?;
     Ok(())
 }
 
 #[pyfunction]
 fn gpu_inverse(a_ptr: u64, inv_ptr: u64, n: usize) -> PyResult<()> {
-    let to_py_err = |e: cust::error::CudaError| pyo3::exceptions::PyRuntimeError::new_err(e.to_string());
-
-    cust::init(CudaFlags::empty()).map_err(to_py_err)?;
-    let device = Device::get_device(0).map_err(to_py_err)?;
-    let _context = Context::new(device).map_err(to_py_err)?;
-
-    let mut handle: ffi::CusolverDnHandle = std::ptr::null_mut();
-    
-    let identity = {
-        let mut id = vec![0.0f32; n * n];
-        for i in 0..n { id[i * n + i] = 1.0; }
-        id
-    };
+    let _ctx = get_gpu_context()?;
+    let mut identity = vec![0f32; n * n];
+    for i in 0..n { identity[i * n + i] = 1.0f32; }
     let inv_dev_temp = DeviceBuffer::from_slice(&identity).map_err(to_py_err)?;
-    
     unsafe {
-        let a_dev_ptr = a_ptr as *mut f32;
+        let mut handle: ffi::CusolverDnHandle = std::ptr::null_mut();
         ffi::cusolverDnCreate(&mut handle);
         let ipiv_dev = DeviceBuffer::<c_int>::uninitialized(n).map_err(to_py_err)?;
         let info_dev = DeviceBuffer::<c_int>::uninitialized(1).map_err(to_py_err)?;
         let mut lwork: c_int = 0;
-
+        let a_dev_ptr = a_ptr as *mut f32;
         ffi::cusolverDnSgetrf_bufferSize(handle, n as c_int, n as c_int, a_dev_ptr, n as c_int, &mut lwork);
         let work_dev = DeviceBuffer::<f32>::uninitialized(lwork as usize).map_err(to_py_err)?;
-
         ffi::cusolverDnSgetrf(handle, n as c_int, n as c_int, a_dev_ptr, n as c_int, work_dev.as_raw_ptr() as *mut f32, ipiv_dev.as_raw_ptr() as *mut i32, info_dev.as_raw_ptr() as *mut i32);
         ffi::cusolverDnSgetrs(handle, 0, n as c_int, n as c_int, a_dev_ptr as *const f32, n as c_int, ipiv_dev.as_raw_ptr() as *const i32, inv_dev_temp.as_raw_ptr() as *mut f32, n as c_int, info_dev.as_raw_ptr() as *mut i32);
-        
         ffi::cusolverDnDestroy(handle);
-
-        let inv_out_ptr = DevicePointer::<f32>::from_raw(inv_ptr);
-        let mut inv_out_slice = DeviceSlice::from_raw_parts(inv_out_ptr, n * n);
+        let mut inv_out_slice = DeviceSlice::from_raw_parts_mut(device_ptr_from_u64(inv_ptr), n * n);
         inv_dev_temp.copy_to(&mut inv_out_slice).map_err(to_py_err)?;
     }
     Ok(())
@@ -271,43 +114,134 @@ fn gpu_inverse(a_ptr: u64, inv_ptr: u64, n: usize) -> PyResult<()> {
 
 #[pyfunction]
 fn solve_normal_equation_device(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples: usize, features: usize) -> PyResult<()> {
-    let to_py_err = |e: cust::error::CudaError| pyo3::exceptions::PyRuntimeError::new_err(e.to_string());
-    cust::init(CudaFlags::empty()).map_err(to_py_err)?;
-    let device = Device::get_device(0).map_err(to_py_err)?;
-    let _context = Context::new(device).map_err(to_py_err)?;
-
+    let ctx = get_gpu_context()?;
     unsafe {
         let x_t_dev = DeviceBuffer::<f32>::uninitialized(features * samples).map_err(to_py_err)?;
         let xtx_dev = DeviceBuffer::<f32>::uninitialized(features * features).map_err(to_py_err)?;
         let xtx_inv_dev = DeviceBuffer::<f32>::uninitialized(features * features).map_err(to_py_err)?;
         let intermediate_dev = DeviceBuffer::<f32>::uninitialized(features * samples).map_err(to_py_err)?;
-
         gpu_transpose(x_ptr, x_t_dev.as_raw_ptr() as u64, samples, features)?;
-
-        gpu_matrix_multiply(
-            x_t_dev.as_raw_ptr() as u64,
-            x_ptr,
-            xtx_dev.as_raw_ptr() as u64,
-            features, samples, features
-        )?;
-
+        gpu_matrix_multiply(x_t_dev.as_raw_ptr() as u64, x_ptr, xtx_dev.as_raw_ptr() as u64, features, samples, features)?;
         gpu_inverse(xtx_dev.as_raw_ptr() as u64, xtx_inv_dev.as_raw_ptr() as u64, features)?;
-
-        gpu_matrix_multiply(
-            xtx_inv_dev.as_raw_ptr() as u64,
-            x_t_dev.as_raw_ptr() as u64,
-            intermediate_dev.as_raw_ptr() as u64,
-            features, features, samples
-        )?;
-
-        gpu_matrix_multiply(
-            intermediate_dev.as_raw_ptr() as u64,
-            y_ptr,
-            theta_ptr,
-            features, samples, 1
-        )?;
+        gpu_matrix_multiply(xtx_inv_dev.as_raw_ptr() as u64, x_t_dev.as_raw_ptr() as u64, intermediate_dev.as_raw_ptr() as u64, features, features, samples)?;
+        gpu_matrix_multiply(intermediate_dev.as_raw_ptr() as u64, y_ptr, theta_ptr, features, samples, 1)?;
     }
-    
+    ctx.stream.synchronize().map_err(to_py_err)?;
+    Ok(())
+}
+
+#[pyfunction]
+fn train_logistic_gpu(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples: usize, features: usize, max_iter: usize, lr: f32, tol: f32, l1: f32, l2: f32) -> PyResult<()> {
+    let ctx = get_gpu_context()?;
+    let matmul_f = ctx.module.get_function("matmul").map_err(to_py_err)?;
+    let sigmoid_f = ctx.module.get_function("elementwise_sigmoid").map_err(to_py_err)?;
+    let sub_f = ctx.module.get_function("elementwise_sub").map_err(to_py_err)?;
+    let transpose_f = ctx.module.get_function("transpose").map_err(to_py_err)?;
+    let axpy_f = ctx.module.get_function("axpy").map_err(to_py_err)?;
+    let grid256 = |n: usize| ((n as u32 + 255) / 256, 1, 1);
+    let block256 = (256, 1, 1);
+    let grid16 = |m: usize, k: usize| ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1);
+    let block16 = (16, 16, 1);
+    let stream = &ctx.stream;
+    let theta_dev_ptr = device_ptr_from_u64(theta_ptr);
+    unsafe {
+        let h_dev = DeviceBuffer::<f32>::uninitialized(samples).map_err(to_py_err)?;
+        let error_dev = DeviceBuffer::<f32>::uninitialized(samples).map_err(to_py_err)?;
+        let x_t_dev = DeviceBuffer::<f32>::uninitialized(features * samples).map_err(to_py_err)?;
+        let grad_dev = DeviceBuffer::<f32>::uninitialized(features).map_err(to_py_err)?;
+
+        launch!(transpose_f<<<grid16(features, samples), block16, 0, stream>>>(
+            device_ptr_from_u64(x_ptr), 
+            x_t_dev.as_device_ptr(), 
+            samples as i32, 
+            features as i32
+        )).map_err(to_py_err)?;
+
+        for i in 0..max_iter {
+            launch!(matmul_f<<<grid16(samples, 1), block16, 0, stream>>>(
+                device_ptr_from_u64(x_ptr), 
+                theta_dev_ptr, 
+                h_dev.as_device_ptr(), 
+                samples as i32, 
+                features as i32, 
+                1 as i32
+            )).map_err(to_py_err)?;
+            
+            launch!(sigmoid_f<<<grid256(samples), block256, 0, stream>>>(
+                h_dev.as_device_ptr(), 
+                samples as i32
+            )).map_err(to_py_err)?;
+            
+            launch!(sub_f<<<grid256(samples), block256, 0, stream>>>(
+                h_dev.as_device_ptr(), 
+                device_ptr_from_u64(y_ptr), 
+                error_dev.as_device_ptr(), 
+                samples as i32
+            )).map_err(to_py_err)?;
+            
+            launch!(matmul_f<<<grid16(features, 1), block16, 0, stream>>>(
+                x_t_dev.as_device_ptr(), 
+                error_dev.as_device_ptr(), 
+                grad_dev.as_device_ptr(), 
+                features as i32, 
+                samples as i32, 
+                1 as i32
+            )).map_err(to_py_err)?;
+
+            if l2 != 0.0 {
+                let l2_scale = l2 * 2.0;
+                launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(
+                    l2_scale,
+                    theta_dev_ptr,
+                    grad_dev.as_device_ptr(),
+                    features as i32
+                )).map_err(to_py_err)?;
+            }
+
+            let alpha = -lr / (samples as f32);
+            launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(
+                alpha, 
+                grad_dev.as_device_ptr(), 
+                theta_dev_ptr, 
+                features as i32
+            )).map_err(to_py_err)?;
+            
+            if l1 != 0.0 && i % 10 == 0 {
+                stream.synchronize().map_err(to_py_err)?;
+                let mut theta_host = vec![0f32; features];
+                let theta_slice = DeviceSlice::from_raw_parts(theta_dev_ptr, features);
+                theta_slice.copy_to(&mut theta_host).map_err(to_py_err)?;
+                
+                let threshold = lr * l1 / samples as f32;
+                for val in theta_host.iter_mut() {
+                    if *val > threshold {
+                        *val -= threshold;
+                    } else if *val < -threshold {
+                        *val += threshold;
+                    } else {
+                        *val = 0.0;
+                    }
+                }
+                
+                let theta_updated = DeviceBuffer::from_slice(&theta_host).map_err(to_py_err)?;
+                let mut theta_out_slice = DeviceSlice::from_raw_parts_mut(theta_dev_ptr, features);
+                theta_updated.copy_to(&mut theta_out_slice).map_err(to_py_err)?;
+            }
+
+            if i % 50 == 0 {
+                stream.synchronize().map_err(to_py_err)?;
+                let mut grad_host = vec![0f32; features];
+                grad_dev.copy_to(&mut grad_host).map_err(to_py_err)?;
+                
+                let grad_norm = grad_host.iter().map(|&g| g * g).sum::<f32>().sqrt();
+                
+                if grad_norm < tol { 
+                    break; 
+                }
+            }
+        }
+    }
+    ctx.stream.synchronize().map_err(to_py_err)?;
     Ok(())
 }
 
@@ -317,6 +251,6 @@ fn rusty_machine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gpu_transpose, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_inverse, m)?)?;
     m.add_function(wrap_pyfunction!(solve_normal_equation_device, m)?)?;
-    m.add_function(wrap_pyfunction!(train_logistic_lbfgs, m)?)?;
+    m.add_function(wrap_pyfunction!(train_logistic_gpu, m)?)?;
     Ok(())
 }
