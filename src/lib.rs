@@ -150,7 +150,7 @@ fn train_logistic_gpu(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples: usize, fe
         let x_t_dev = DeviceBuffer::<f32>::uninitialized(features * samples).map_err(to_py_err)?;
         let grad_dev = DeviceBuffer::<f32>::uninitialized(features).map_err(to_py_err)?;
 
-        launch!(transpose_f<<<grid16(features, samples), block16, 0, stream>>>(
+        launch!(transpose_f<<<grid16(samples, features), block16, 0, stream>>>(
             device_ptr_from_u64(x_ptr), 
             x_t_dev.as_device_ptr(), 
             samples as i32, 
@@ -189,61 +189,63 @@ fn train_logistic_gpu(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples: usize, fe
             )).map_err(to_py_err)?;
 
             if l2 != 0.0 {
-                let l2_scale = l2 * 2.0;
-                launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(
-                    l2_scale,
-                    theta_dev_ptr,
-                    grad_dev.as_device_ptr(),
-                    features as i32
-                )).map_err(to_py_err)?;
-            }
+                            // We apply the L2 gradient component: grad += l2 * theta
+                            // The axpy kernel calculates: y = alpha * x + y
+                            // So, grad_dev = l2 * theta_dev_ptr + grad_dev
+                            launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(
+                                l2, // alpha: The regularization parameter
+                                theta_dev_ptr, // x: The weights
+                                grad_dev.as_device_ptr(), // y: The gradient array to be updated
+                                features as i32 // n: The number of elements
+                            )).map_err(to_py_err)?;
+                        }
 
-            let alpha = -lr / (samples as f32);
-            launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(
-                alpha, 
-                grad_dev.as_device_ptr(), 
-                theta_dev_ptr, 
-                features as i32
-            )).map_err(to_py_err)?;
-            
-            if l1 != 0.0 && i % 10 == 0 {
-                stream.synchronize().map_err(to_py_err)?;
-                let mut theta_host = vec![0f32; features];
-                let theta_slice = DeviceSlice::from_raw_parts(theta_dev_ptr, features);
-                theta_slice.copy_to(&mut theta_host).map_err(to_py_err)?;
-                
-                let threshold = lr * l1 / samples as f32;
-                for val in theta_host.iter_mut() {
-                    if *val > threshold {
-                        *val -= threshold;
-                    } else if *val < -threshold {
-                        *val += threshold;
-                    } else {
-                        *val = 0.0;
+                        let alpha = -lr / (samples as f32);
+                        launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(
+                            alpha, 
+                            grad_dev.as_device_ptr(), 
+                            theta_dev_ptr, 
+                            features as i32
+                        )).map_err(to_py_err)?;
+                        
+                        if l1 != 0.0 && i % 10 == 0 {
+                            stream.synchronize().map_err(to_py_err)?;
+                            let mut theta_host = vec![0f32; features];
+                            let theta_slice = DeviceSlice::from_raw_parts(theta_dev_ptr, features);
+                            theta_slice.copy_to(&mut theta_host).map_err(to_py_err)?;
+                            
+                            let threshold = lr * l1 / samples as f32;
+                            for val in theta_host.iter_mut() {
+                                if *val > threshold {
+                                    *val -= threshold;
+                                } else if *val < -threshold {
+                                    *val += threshold;
+                                } else {
+                                    *val = 0.0;
+                                }
+                            }
+                            
+                            let theta_updated = DeviceBuffer::from_slice(&theta_host).map_err(to_py_err)?;
+                            let mut theta_out_slice = DeviceSlice::from_raw_parts_mut(theta_dev_ptr, features);
+                            theta_updated.copy_to(&mut theta_out_slice).map_err(to_py_err)?;
+                        }
+
+                        if i % 50 == 0 {
+                            stream.synchronize().map_err(to_py_err)?;
+                            let mut grad_host = vec![0f32; features];
+                            grad_dev.copy_to(&mut grad_host).map_err(to_py_err)?;
+                            
+                            let grad_norm = grad_host.iter().map(|&g| g * g).sum::<f32>().sqrt();
+                            
+                            if grad_norm < tol { 
+                                break; 
+                            }
+                        }
                     }
                 }
-                
-                let theta_updated = DeviceBuffer::from_slice(&theta_host).map_err(to_py_err)?;
-                let mut theta_out_slice = DeviceSlice::from_raw_parts_mut(theta_dev_ptr, features);
-                theta_updated.copy_to(&mut theta_out_slice).map_err(to_py_err)?;
+                ctx.stream.synchronize().map_err(to_py_err)?;
+                Ok(())
             }
-
-            if i % 50 == 0 {
-                stream.synchronize().map_err(to_py_err)?;
-                let mut grad_host = vec![0f32; features];
-                grad_dev.copy_to(&mut grad_host).map_err(to_py_err)?;
-                
-                let grad_norm = grad_host.iter().map(|&g| g * g).sum::<f32>().sqrt();
-                
-                if grad_norm < tol { 
-                    break; 
-                }
-            }
-        }
-    }
-    ctx.stream.synchronize().map_err(to_py_err)?;
-    Ok(())
-}
 
 #[pymodule]
 fn rusty_machine(m: &Bound<'_, PyModule>) -> PyResult<()> {
