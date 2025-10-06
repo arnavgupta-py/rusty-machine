@@ -5,6 +5,7 @@ use pyo3::wrap_pyfunction;
 use std::sync::OnceLock;
 use std::os::raw::c_int;
 
+// FFI definitions for cuSOLVER
 mod ffi {
     use super::c_int;
     #[repr(C)]
@@ -20,6 +21,7 @@ mod ffi {
     }
 }
 
+// Global context for CUDA
 struct GpuContext {
     _ctx: Context,
     stream: Stream,
@@ -28,10 +30,12 @@ struct GpuContext {
 
 static GLOBAL_CTX: OnceLock<GpuContext> = OnceLock::new();
 
+// Helper function to convert errors to Python exceptions
 fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
+// Singleton to initialize and get the CUDA context
 fn get_gpu_context() -> PyResult<&'static GpuContext> {
     if let Some(ctx) = GLOBAL_CTX.get() {
         return Ok(ctx);
@@ -53,6 +57,7 @@ fn get_gpu_context() -> PyResult<&'static GpuContext> {
     }
 }
 
+// Helper to create a DevicePointer from a u64
 fn device_ptr_from_u64(ptr: u64) -> DevicePointer<f32> {
     DevicePointer::from_raw(ptr)
 }
@@ -60,7 +65,7 @@ fn device_ptr_from_u64(ptr: u64) -> DevicePointer<f32> {
 #[pyfunction]
 fn gpu_matrix_multiply(a_ptr: u64, b_ptr: u64, c_ptr: u64, m: usize, n: usize, k: usize) -> PyResult<()> {
     let ctx = get_gpu_context()?;
-    let func = ctx.module.get_function("matmul").map_err(to_py_err)?;
+    let func = ctx.module.get_function("matmul_tiled").map_err(to_py_err)?;
     let grid_dims = ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1);
     let block_dims = (16, 16, 1);
     let stream = &ctx.stream;
@@ -133,119 +138,79 @@ fn solve_normal_equation_device(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples:
 #[pyfunction]
 fn train_logistic_gpu(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples: usize, features: usize, max_iter: usize, lr: f32, tol: f32, l1: f32, l2: f32) -> PyResult<()> {
     let ctx = get_gpu_context()?;
-    let matmul_f = ctx.module.get_function("matmul").map_err(to_py_err)?;
+    let matmul_f = ctx.module.get_function("matmul_tiled").map_err(to_py_err)?;
     let sigmoid_f = ctx.module.get_function("elementwise_sigmoid").map_err(to_py_err)?;
     let sub_f = ctx.module.get_function("elementwise_sub").map_err(to_py_err)?;
     let transpose_f = ctx.module.get_function("transpose").map_err(to_py_err)?;
     let axpy_f = ctx.module.get_function("axpy").map_err(to_py_err)?;
+    let sum_sq_f = ctx.module.get_function("sum_of_squares_reduction").map_err(to_py_err)?;
+    let l1_f = ctx.module.get_function("proximal_update_l1").map_err(to_py_err)?;
+
     let grid256 = |n: usize| ((n as u32 + 255) / 256, 1, 1);
     let block256 = (256, 1, 1);
     let grid16 = |m: usize, k: usize| ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1);
     let block16 = (16, 16, 1);
     let stream = &ctx.stream;
     let theta_dev_ptr = device_ptr_from_u64(theta_ptr);
+
     unsafe {
         let h_dev = DeviceBuffer::<f32>::uninitialized(samples).map_err(to_py_err)?;
         let error_dev = DeviceBuffer::<f32>::uninitialized(samples).map_err(to_py_err)?;
         let x_t_dev = DeviceBuffer::<f32>::uninitialized(features * samples).map_err(to_py_err)?;
         let grad_dev = DeviceBuffer::<f32>::uninitialized(features).map_err(to_py_err)?;
+        let num_blocks = (features + 255) / 256;
+        let partial_sums_dev = DeviceBuffer::<f32>::uninitialized(num_blocks).map_err(to_py_err)?;
+        let mut grad_norm_sq_host = vec![0.0f32; num_blocks];
 
         launch!(transpose_f<<<grid16(samples, features), block16, 0, stream>>>(
-            device_ptr_from_u64(x_ptr), 
-            x_t_dev.as_device_ptr(), 
-            samples as i32, 
+            device_ptr_from_u64(x_ptr),
+            x_t_dev.as_device_ptr(),
+            samples as i32,
             features as i32
         )).map_err(to_py_err)?;
 
         for i in 0..max_iter {
-            launch!(matmul_f<<<grid16(samples, 1), block16, 0, stream>>>(
-                device_ptr_from_u64(x_ptr), 
-                theta_dev_ptr, 
-                h_dev.as_device_ptr(), 
-                samples as i32, 
-                features as i32, 
-                1 as i32
-            )).map_err(to_py_err)?;
-            
-            launch!(sigmoid_f<<<grid256(samples), block256, 0, stream>>>(
-                h_dev.as_device_ptr(), 
-                samples as i32
-            )).map_err(to_py_err)?;
-            
-            launch!(sub_f<<<grid256(samples), block256, 0, stream>>>(
-                h_dev.as_device_ptr(), 
-                device_ptr_from_u64(y_ptr), 
-                error_dev.as_device_ptr(), 
-                samples as i32
-            )).map_err(to_py_err)?;
-            
-            launch!(matmul_f<<<grid16(features, 1), block16, 0, stream>>>(
-                x_t_dev.as_device_ptr(), 
-                error_dev.as_device_ptr(), 
-                grad_dev.as_device_ptr(), 
-                features as i32, 
-                samples as i32, 
-                1 as i32
-            )).map_err(to_py_err)?;
+            launch!(matmul_f<<<grid16(samples, 1), block16, 0, stream>>>(device_ptr_from_u64(x_ptr), theta_dev_ptr, h_dev.as_device_ptr(), samples as i32, features as i32, 1)).map_err(to_py_err)?;
+            launch!(sigmoid_f<<<grid256(samples), block256, 0, stream>>>(h_dev.as_device_ptr(), samples as i32)).map_err(to_py_err)?;
+            launch!(sub_f<<<grid256(samples), block256, 0, stream>>>(h_dev.as_device_ptr(), device_ptr_from_u64(y_ptr), error_dev.as_device_ptr(), samples as i32)).map_err(to_py_err)?;
+            launch!(matmul_f<<<grid16(features, 1), block16, 0, stream>>>(x_t_dev.as_device_ptr(), error_dev.as_device_ptr(), grad_dev.as_device_ptr(), features as i32, samples as i32, 1)).map_err(to_py_err)?;
 
             if l2 != 0.0 {
-                            // We apply the L2 gradient component: grad += l2 * theta
-                            // The axpy kernel calculates: y = alpha * x + y
-                            // So, grad_dev = l2 * theta_dev_ptr + grad_dev
-                            launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(
-                                l2, // alpha: The regularization parameter
-                                theta_dev_ptr, // x: The weights
-                                grad_dev.as_device_ptr(), // y: The gradient array to be updated
-                                features as i32 // n: The number of elements
-                            )).map_err(to_py_err)?;
-                        }
-
-                        let alpha = -lr / (samples as f32);
-                        launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(
-                            alpha, 
-                            grad_dev.as_device_ptr(), 
-                            theta_dev_ptr, 
-                            features as i32
-                        )).map_err(to_py_err)?;
-                        
-                        if l1 != 0.0 && i % 10 == 0 {
-                            stream.synchronize().map_err(to_py_err)?;
-                            let mut theta_host = vec![0f32; features];
-                            let theta_slice = DeviceSlice::from_raw_parts(theta_dev_ptr, features);
-                            theta_slice.copy_to(&mut theta_host).map_err(to_py_err)?;
-                            
-                            let threshold = lr * l1 / samples as f32;
-                            for val in theta_host.iter_mut() {
-                                if *val > threshold {
-                                    *val -= threshold;
-                                } else if *val < -threshold {
-                                    *val += threshold;
-                                } else {
-                                    *val = 0.0;
-                                }
-                            }
-                            
-                            let theta_updated = DeviceBuffer::from_slice(&theta_host).map_err(to_py_err)?;
-                            let mut theta_out_slice = DeviceSlice::from_raw_parts_mut(theta_dev_ptr, features);
-                            theta_updated.copy_to(&mut theta_out_slice).map_err(to_py_err)?;
-                        }
-
-                        if i % 50 == 0 {
-                            stream.synchronize().map_err(to_py_err)?;
-                            let mut grad_host = vec![0f32; features];
-                            grad_dev.copy_to(&mut grad_host).map_err(to_py_err)?;
-                            
-                            let grad_norm = grad_host.iter().map(|&g| g * g).sum::<f32>().sqrt();
-                            
-                            if grad_norm < tol { 
-                                break; 
-                            }
-                        }
-                    }
-                }
-                ctx.stream.synchronize().map_err(to_py_err)?;
-                Ok(())
+                launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(l2, theta_dev_ptr, grad_dev.as_device_ptr(), features as i32)).map_err(to_py_err)?;
             }
+            
+            if i % 50 == 0 {
+                launch!(sum_sq_f<<<grid256(features), block256, 256 * 4, stream>>>(
+                    grad_dev.as_device_ptr(),
+                    partial_sums_dev.as_device_ptr(),
+                    features as i32
+                )).map_err(to_py_err)?;
+                
+                partial_sums_dev.copy_to(&mut grad_norm_sq_host).map_err(to_py_err)?;
+                stream.synchronize().map_err(to_py_err)?;
+
+                let grad_norm = grad_norm_sq_host.iter().sum::<f32>().sqrt();
+                if grad_norm < tol {
+                    break;
+                }
+            }
+            
+            let alpha = -lr / (samples as f32);
+            launch!(axpy_f<<<grid256(features), block256, 0, stream>>>(alpha, grad_dev.as_device_ptr(), theta_dev_ptr, features as i32)).map_err(to_py_err)?;
+
+            if l1 != 0.0 {
+                let threshold = lr * l1 / samples as f32;
+                launch!(l1_f<<<grid256(features), block256, 0, stream>>>(
+                    theta_dev_ptr,
+                    threshold,
+                    features as i32
+                )).map_err(to_py_err)?;
+            }
+        }
+    }
+    ctx.stream.synchronize().map_err(to_py_err)?;
+    Ok(())
+}
 
 #[pymodule]
 fn rusty_machine(m: &Bound<'_, PyModule>) -> PyResult<()> {

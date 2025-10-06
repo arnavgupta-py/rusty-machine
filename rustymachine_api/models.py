@@ -8,17 +8,10 @@ class LinearRegression:
         self.intercept_ = None
 
     def fit(self, X, y):
-        X = np.asarray(X, dtype=np.float32) if isinstance(X, np.ndarray) else X.astype(cp.float32)
-        y = np.asarray(y, dtype=np.float32) if isinstance(y, np.ndarray) else y.astype(cp.float32)
+        X_gpu = cp.asarray(X, dtype=cp.float32)
+        y_gpu = cp.asarray(y, dtype=cp.float32).reshape(-1, 1)
 
-        if X.ndim != 2 or y.ndim not in (1, 2):
-            raise ValueError("X must be 2D and y must be 1D or 2D")
-        if X.shape[0] != y.shape[0]:
-            raise ValueError("Number of samples in X and y must match")
-
-        X_gpu = cp.asarray(X)
-        y_gpu = cp.asarray(y).reshape(-1, 1)
-
+        # Add intercept term to X
         ones = cp.ones((X_gpu.shape[0], 1), dtype=cp.float32)
         X_b_gpu = cp.hstack([ones, X_gpu])
         samples, features = X_b_gpu.shape
@@ -41,11 +34,13 @@ class LinearRegression:
 
     def predict(self, X):
         if self.coef_ is None:
-            raise RuntimeError("Call fit() before predict()")
+            raise RuntimeError("The model has not been fitted yet. Call fit() before predict().")
 
-        X_gpu = cp.asarray(X, dtype=cp.float32)
-        predictions_gpu = X_gpu @ cp.asarray(self.coef_.reshape(-1, 1)) + self.intercept_
-        return predictions_gpu.get()
+        # Ensure X is a numpy array for the dot product, not cupy
+        X_np = cp.asnumpy(X) if isinstance(X, cp.ndarray) else X
+        
+        logits = X_np @ self.coef_ + self.intercept_
+        return logits.reshape(-1, 1)
 
 
 class LogisticRegression:
@@ -62,6 +57,7 @@ class LogisticRegression:
         X_gpu = cp.asarray(X, dtype=cp.float32)
         y_gpu = cp.asarray(y, dtype=np.float32).reshape(-1, 1)
 
+        # Add intercept term to X
         ones = cp.ones((X_gpu.shape[0], 1), dtype=cp.float32)
         X_b_gpu = cp.hstack([ones, X_gpu])
         samples, features = X_b_gpu.shape
@@ -92,12 +88,23 @@ class LogisticRegression:
 
     def predict_proba(self, X):
         if self.coef_ is None:
-            raise RuntimeError("Call fit() before predict_proba()")
+            raise RuntimeError("The model has not been fitted yet. Call fit() before predict_proba().")
 
-        logits = X @ self.coef_ + self.intercept_
-        probs = 1 / (1 + np.exp(-logits))
-        return probs.reshape(-1, 1)
+        X_np = cp.asnumpy(X) if isinstance(X, cp.ndarray) else X
+
+        # Calculate logits using numpy
+        logits = X_np @ self.coef_ + self.intercept_
+        
+        # Improved numerical stability for the sigmoid function
+        # Clip logits to prevent overflow in np.exp
+        logits_clipped = np.clip(logits, -20, 20)
+        probs = 1 / (1 + np.exp(-logits_clipped))
+        
+        # Return probabilities for both classes
+        return np.hstack([1 - probs.reshape(-1, 1), probs.reshape(-1, 1)])
 
     def predict(self, X):
-        probs = self.predict_proba(X)
-        return (probs > 0.5).astype(int)
+        # Predicts the class with the highest probability
+        # The second column (index 1) is the probability of the positive class
+        probabilities = self.predict_proba(X)
+        return (probabilities[:, 1] > 0.5).astype(int)
