@@ -30,12 +30,10 @@ struct GpuContext {
 
 static GLOBAL_CTX: OnceLock<GpuContext> = OnceLock::new();
 
-// Helper function to convert errors to Python exceptions
 fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
-// Singleton to initialize and get the CUDA context
 fn get_gpu_context() -> PyResult<&'static GpuContext> {
     if let Some(ctx) = GLOBAL_CTX.get() {
         return Ok(ctx);
@@ -57,7 +55,6 @@ fn get_gpu_context() -> PyResult<&'static GpuContext> {
     }
 }
 
-// Helper to create a DevicePointer from a u64
 fn device_ptr_from_u64(ptr: u64) -> DevicePointer<f32> {
     DevicePointer::from_raw(ptr)
 }
@@ -99,6 +96,7 @@ fn gpu_inverse(a_ptr: u64, inv_ptr: u64, n: usize) -> PyResult<()> {
     let mut identity = vec![0f32; n * n];
     for i in 0..n { identity[i * n + i] = 1.0f32; }
     let inv_dev_temp = DeviceBuffer::from_slice(&identity).map_err(to_py_err)?;
+    
     unsafe {
         let mut handle: ffi::CusolverDnHandle = std::ptr::null_mut();
         ffi::cusolverDnCreate(&mut handle);
@@ -123,11 +121,15 @@ fn solve_normal_equation_device(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples:
     unsafe {
         let x_t_dev = DeviceBuffer::<f32>::uninitialized(features * samples).map_err(to_py_err)?;
         let xtx_dev = DeviceBuffer::<f32>::uninitialized(features * features).map_err(to_py_err)?;
-        let xtx_inv_dev = DeviceBuffer::<f32>::uninitialized(features * features).map_err(to_py_err)?;
+        let mut xtx_inv_dev = DeviceBuffer::<f32>::uninitialized(features * features).map_err(to_py_err)?;
         let intermediate_dev = DeviceBuffer::<f32>::uninitialized(features * samples).map_err(to_py_err)?;
+        
         gpu_transpose(x_ptr, x_t_dev.as_raw_ptr() as u64, samples, features)?;
         gpu_matrix_multiply(x_t_dev.as_raw_ptr() as u64, x_ptr, xtx_dev.as_raw_ptr() as u64, features, samples, features)?;
-        gpu_inverse(xtx_dev.as_raw_ptr() as u64, xtx_inv_dev.as_raw_ptr() as u64, features)?;
+        
+        xtx_dev.copy_to(&mut xtx_inv_dev).map_err(to_py_err)?;
+        gpu_inverse(xtx_inv_dev.as_raw_ptr() as u64, xtx_inv_dev.as_raw_ptr() as u64, features)?;
+        
         gpu_matrix_multiply(xtx_inv_dev.as_raw_ptr() as u64, x_t_dev.as_raw_ptr() as u64, intermediate_dev.as_raw_ptr() as u64, features, features, samples)?;
         gpu_matrix_multiply(intermediate_dev.as_raw_ptr() as u64, y_ptr, theta_ptr, features, samples, 1)?;
     }
@@ -135,7 +137,9 @@ fn solve_normal_equation_device(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples:
     Ok(())
 }
 
+// ✅ **THE FIX**: Restored the full implementation for the original GD solver.
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 fn train_logistic_gpu(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples: usize, features: usize, max_iter: usize, lr: f32, tol: f32, l1: f32, l2: f32) -> PyResult<()> {
     let ctx = get_gpu_context()?;
     let matmul_f = ctx.module.get_function("matmul_tiled").map_err(to_py_err)?;
@@ -212,12 +216,95 @@ fn train_logistic_gpu(x_ptr: u64, y_ptr: u64, theta_ptr: u64, samples: usize, fe
     Ok(())
 }
 
+fn get_column_ptr(matrix_ptr: DevicePointer<f32>, col_idx: usize, num_rows: usize) -> DevicePointer<f32> {
+    unsafe { matrix_ptr.offset((col_idx * num_rows) as isize) }
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn train_logistic_sgd_l1_gpu(
+    x_col_major_ptr: u64,
+    y_ptr: u64,
+    theta_ptr: u64,
+    samples: usize,
+    features: usize,
+    epochs: usize,
+    lr: f32,
+    l1_penalty: f32,
+) -> PyResult<()> {
+    let ctx = get_gpu_context()?;
+    let stream = &ctx.stream;
+
+    let matmul_f = ctx.module.get_function("matmul_tiled").map_err(to_py_err)?;
+    let grad_f = ctx.module.get_function("fused_gradient_from_logits").map_err(to_py_err)?;
+    let update_f = ctx.module.get_function("update_theta_and_z").map_err(to_py_err)?;
+
+    let x_col_major_dev_ptr = device_ptr_from_u64(x_col_major_ptr);
+    let y_dev_ptr = device_ptr_from_u64(y_ptr);
+    let theta_dev_ptr = device_ptr_from_u64(theta_ptr);
+
+    // ✅ **THE FIX**: Removed `mut` from z_dev as it's not reassigned.
+    let (z_dev, mut grad_j_dev, x_row_major_dev) = unsafe {
+        (
+            DeviceBuffer::<f32>::uninitialized(samples).map_err(to_py_err)?,
+            DeviceBuffer::<f32>::uninitialized(1).map_err(to_py_err)?,
+            DeviceBuffer::<f32>::uninitialized(samples * features).map_err(to_py_err)?,
+        )
+    };
+    
+    gpu_transpose(x_col_major_ptr, x_row_major_dev.as_raw_ptr() as u64, samples, features)?;
+
+    let block_size = 256u32;
+    let grid_size_samples = (samples as u32 + block_size - 1) / block_size;
+    
+    unsafe {
+        launch!(matmul_f<<<((1 + 15) / 16, (samples as u32 + 15) / 16, 1), (16, 16, 1), 0, stream>>>(
+            x_row_major_dev.as_device_ptr(),
+            theta_dev_ptr,
+            z_dev.as_device_ptr(),
+            samples as i32, features as i32, 1
+        )).map_err(to_py_err)?;
+    }
+
+    for _ in 0..epochs {
+        for j in 0..features {
+            let x_col_ptr = get_column_ptr(x_col_major_dev_ptr, j, samples);
+            
+            grad_j_dev.copy_from(&[0.0f32]).map_err(to_py_err)?;
+            
+            unsafe {
+                launch!(grad_f<<<grid_size_samples, block_size, block_size * 4, stream>>>(
+                    x_col_ptr,
+                    y_dev_ptr,
+                    z_dev.as_device_ptr(),
+                    grad_j_dev.as_device_ptr(),
+                    samples as i32
+                )).map_err(to_py_err)?;
+
+                launch!(update_f<<<grid_size_samples, block_size, 0, stream>>>(
+                    theta_dev_ptr,
+                    z_dev.as_device_ptr(),
+                    x_col_ptr,
+                    grad_j_dev.as_device_ptr(),
+                    j as i32,
+                    samples as i32,
+                    lr,
+                    l1_penalty
+                )).map_err(to_py_err)?;
+            }
+        }
+    }
+    ctx.stream.synchronize().map_err(to_py_err)?;
+    Ok(())
+}
+
 #[pymodule]
 fn rusty_machine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gpu_matrix_multiply, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_transpose, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_inverse, m)?)?;
     m.add_function(wrap_pyfunction!(solve_normal_equation_device, m)?)?;
-    m.add_function(wrap_pyfunction!(train_logistic_gpu, m)?)?;
+    m.add_function(wrap_pyfunction!(train_logistic_gpu, m)?)?; 
+    m.add_function(wrap_pyfunction!(train_logistic_sgd_l1_gpu, m)?)?;
     Ok(())
 }
