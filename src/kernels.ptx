@@ -13,8 +13,6 @@
 	// .globl	matmul_tiled
 // _ZZ12matmul_tiledE2As has been demoted
 // _ZZ12matmul_tiledE2Bs has been demoted
-// _ZZ18update_theta_and_zE11delta_theta has been demoted
-.extern .shared .align 16 .b8 cache[];
 
 .visible .entry matmul_tiled(
 	.param .u64 matmul_tiled_param_0,
@@ -219,20 +217,24 @@ $L__BB1_2:
 	ret;
 
 }
-	// .globl	elementwise_sigmoid
-.visible .entry elementwise_sigmoid(
-	.param .u64 elementwise_sigmoid_param_0,
-	.param .u32 elementwise_sigmoid_param_1
+	// .globl	fused_sigmoid_sub
+.visible .entry fused_sigmoid_sub(
+	.param .u64 fused_sigmoid_sub_param_0,
+	.param .u64 fused_sigmoid_sub_param_1,
+	.param .u64 fused_sigmoid_sub_param_2,
+	.param .u32 fused_sigmoid_sub_param_3
 )
 {
 	.reg .pred 	%p<2>;
-	.reg .f32 	%f<20>;
+	.reg .f32 	%f<22>;
 	.reg .b32 	%r<8>;
-	.reg .b64 	%rd<5>;
+	.reg .b64 	%rd<11>;
 
 
-	ld.param.u64 	%rd1, [elementwise_sigmoid_param_0];
-	ld.param.u32 	%r2, [elementwise_sigmoid_param_1];
+	ld.param.u64 	%rd1, [fused_sigmoid_sub_param_0];
+	ld.param.u64 	%rd2, [fused_sigmoid_sub_param_1];
+	ld.param.u64 	%rd3, [fused_sigmoid_sub_param_2];
+	ld.param.u32 	%r2, [fused_sigmoid_sub_param_3];
 	mov.u32 	%r3, %ctaid.x;
 	mov.u32 	%r4, %ntid.x;
 	mov.u32 	%r5, %tid.x;
@@ -240,10 +242,10 @@ $L__BB1_2:
 	setp.ge.s32 	%p1, %r1, %r2;
 	@%p1 bra 	$L__BB2_2;
 
-	cvta.to.global.u64 	%rd2, %rd1;
-	mul.wide.s32 	%rd3, %r1, 4;
-	add.s64 	%rd4, %rd2, %rd3;
-	ld.global.f32 	%f1, [%rd4];
+	cvta.to.global.u64 	%rd4, %rd1;
+	mul.wide.s32 	%rd5, %r1, 4;
+	add.s64 	%rd6, %rd4, %rd5;
+	ld.global.f32 	%f1, [%rd6];
 	neg.f32 	%f2, %f1;
 	mov.f32 	%f3, 0f3F000000;
 	mov.f32 	%f4, 0f3BBB989D;
@@ -264,203 +266,54 @@ $L__BB1_2:
 	ex2.approx.ftz.f32 	%f17, %f15;
 	fma.rn.f32 	%f18, %f17, %f16, 0f3F800000;
 	rcp.rn.f32 	%f19, %f18;
-	st.global.f32 	[%rd4], %f19;
+	cvta.to.global.u64 	%rd7, %rd2;
+	add.s64 	%rd8, %rd7, %rd5;
+	ld.global.f32 	%f20, [%rd8];
+	sub.f32 	%f21, %f19, %f20;
+	cvta.to.global.u64 	%rd9, %rd3;
+	add.s64 	%rd10, %rd9, %rd5;
+	st.global.f32 	[%rd10], %f21;
 
 $L__BB2_2:
 	ret;
 
 }
-	// .globl	fused_gradient_from_logits
-.visible .entry fused_gradient_from_logits(
-	.param .u64 fused_gradient_from_logits_param_0,
-	.param .u64 fused_gradient_from_logits_param_1,
-	.param .u64 fused_gradient_from_logits_param_2,
-	.param .u64 fused_gradient_from_logits_param_3,
-	.param .u32 fused_gradient_from_logits_param_4
+	// .globl	axpy
+.visible .entry axpy(
+	.param .f32 axpy_param_0,
+	.param .u64 axpy_param_1,
+	.param .u64 axpy_param_2,
+	.param .u32 axpy_param_3
 )
 {
-	.reg .pred 	%p<7>;
-	.reg .f32 	%f<35>;
-	.reg .b32 	%r<22>;
-	.reg .b64 	%rd<13>;
+	.reg .pred 	%p<2>;
+	.reg .f32 	%f<5>;
+	.reg .b32 	%r<6>;
+	.reg .b64 	%rd<8>;
 
 
-	ld.param.u64 	%rd4, [fused_gradient_from_logits_param_0];
-	ld.param.u64 	%rd5, [fused_gradient_from_logits_param_1];
-	ld.param.u64 	%rd6, [fused_gradient_from_logits_param_2];
-	ld.param.u64 	%rd7, [fused_gradient_from_logits_param_3];
-	ld.param.u32 	%r11, [fused_gradient_from_logits_param_4];
-	mov.u32 	%r1, %ntid.x;
-	mov.u32 	%r12, %ctaid.x;
-	mov.u32 	%r2, %tid.x;
-	mad.lo.s32 	%r20, %r12, %r1, %r2;
-	setp.ge.s32 	%p1, %r20, %r11;
-	mov.f32 	%f34, 0f00000000;
-	@%p1 bra 	$L__BB3_3;
+	ld.param.f32 	%f1, [axpy_param_0];
+	ld.param.u64 	%rd1, [axpy_param_1];
+	ld.param.u64 	%rd2, [axpy_param_2];
+	ld.param.u32 	%r2, [axpy_param_3];
+	mov.u32 	%r3, %ctaid.x;
+	mov.u32 	%r4, %ntid.x;
+	mov.u32 	%r5, %tid.x;
+	mad.lo.s32 	%r1, %r3, %r4, %r5;
+	setp.ge.s32 	%p1, %r1, %r2;
+	@%p1 bra 	$L__BB3_2;
 
-	mov.u32 	%r13, %nctaid.x;
-	mul.lo.s32 	%r4, %r13, %r1;
-	cvta.to.global.u64 	%rd1, %rd6;
-	cvta.to.global.u64 	%rd2, %rd5;
-	cvta.to.global.u64 	%rd3, %rd4;
+	cvta.to.global.u64 	%rd3, %rd1;
+	mul.wide.s32 	%rd4, %r1, 4;
+	add.s64 	%rd5, %rd3, %rd4;
+	ld.global.f32 	%f2, [%rd5];
+	cvta.to.global.u64 	%rd6, %rd2;
+	add.s64 	%rd7, %rd6, %rd4;
+	ld.global.f32 	%f3, [%rd7];
+	fma.rn.f32 	%f4, %f2, %f1, %f3;
+	st.global.f32 	[%rd7], %f4;
 
 $L__BB3_2:
-	mul.wide.s32 	%rd8, %r20, 4;
-	add.s64 	%rd9, %rd1, %rd8;
-	ld.global.f32 	%f6, [%rd9];
-	neg.f32 	%f7, %f6;
-	mov.f32 	%f8, 0f3F000000;
-	mov.f32 	%f9, 0f3BBB989D;
-	fma.rn.f32 	%f10, %f7, %f9, %f8;
-	mov.f32 	%f11, 0f3FB8AA3B;
-	mov.f32 	%f12, 0f437C0000;
-	cvt.sat.f32.f32 	%f13, %f10;
-	mov.f32 	%f14, 0f4B400001;
-	fma.rm.f32 	%f15, %f13, %f12, %f14;
-	add.f32 	%f16, %f15, 0fCB40007F;
-	neg.f32 	%f17, %f16;
-	fma.rn.f32 	%f18, %f7, %f11, %f17;
-	mov.f32 	%f19, 0f32A57060;
-	fma.rn.f32 	%f20, %f7, %f19, %f18;
-	mov.b32 	%r14, %f15;
-	shl.b32 	%r15, %r14, 23;
-	mov.b32 	%f21, %r15;
-	ex2.approx.ftz.f32 	%f22, %f20;
-	fma.rn.f32 	%f23, %f22, %f21, 0f3F800000;
-	rcp.rn.f32 	%f24, %f23;
-	add.s64 	%rd10, %rd2, %rd8;
-	ld.global.f32 	%f25, [%rd10];
-	sub.f32 	%f26, %f24, %f25;
-	add.s64 	%rd11, %rd3, %rd8;
-	ld.global.f32 	%f27, [%rd11];
-	fma.rn.f32 	%f34, %f27, %f26, %f34;
-	add.s32 	%r20, %r20, %r4;
-	setp.lt.s32 	%p2, %r20, %r11;
-	@%p2 bra 	$L__BB3_2;
-
-$L__BB3_3:
-	shl.b32 	%r16, %r2, 2;
-	mov.u32 	%r17, cache;
-	add.s32 	%r7, %r17, %r16;
-	st.shared.f32 	[%r7], %f34;
-	bar.sync 	0;
-	shr.u32 	%r21, %r1, 1;
-	setp.eq.s32 	%p3, %r21, 0;
-	@%p3 bra 	$L__BB3_8;
-
-$L__BB3_5:
-	setp.ge.s32 	%p4, %r2, %r21;
-	@%p4 bra 	$L__BB3_7;
-
-	shl.b32 	%r18, %r21, 2;
-	add.s32 	%r19, %r7, %r18;
-	ld.shared.f32 	%f28, [%r7];
-	ld.shared.f32 	%f29, [%r19];
-	add.f32 	%f30, %f29, %f28;
-	st.shared.f32 	[%r7], %f30;
-
-$L__BB3_7:
-	bar.sync 	0;
-	shr.s32 	%r10, %r21, 1;
-	setp.gt.s32 	%p5, %r21, 1;
-	mov.u32 	%r21, %r10;
-	@%p5 bra 	$L__BB3_5;
-
-$L__BB3_8:
-	setp.ne.s32 	%p6, %r2, 0;
-	@%p6 bra 	$L__BB3_10;
-
-	ld.shared.f32 	%f31, [cache];
-	cvta.to.global.u64 	%rd12, %rd7;
-	atom.global.add.f32 	%f32, [%rd12], %f31;
-
-$L__BB3_10:
-	ret;
-
-}
-	// .globl	update_theta_and_z
-.visible .entry update_theta_and_z(
-	.param .u64 update_theta_and_z_param_0,
-	.param .u64 update_theta_and_z_param_1,
-	.param .u64 update_theta_and_z_param_2,
-	.param .u64 update_theta_and_z_param_3,
-	.param .u32 update_theta_and_z_param_4,
-	.param .u32 update_theta_and_z_param_5,
-	.param .f32 update_theta_and_z_param_6,
-	.param .f32 update_theta_and_z_param_7
-)
-{
-	.reg .pred 	%p<8>;
-	.reg .f32 	%f<20>;
-	.reg .b32 	%r<13>;
-	.reg .b64 	%rd<14>;
-	// demoted variable
-	.shared .align 4 .f32 _ZZ18update_theta_and_zE11delta_theta;
-
-	ld.param.u64 	%rd3, [update_theta_and_z_param_0];
-	ld.param.u64 	%rd4, [update_theta_and_z_param_1];
-	ld.param.u64 	%rd5, [update_theta_and_z_param_2];
-	ld.param.u64 	%rd6, [update_theta_and_z_param_3];
-	ld.param.u32 	%r8, [update_theta_and_z_param_4];
-	ld.param.u32 	%r9, [update_theta_and_z_param_5];
-	ld.param.f32 	%f2, [update_theta_and_z_param_6];
-	ld.param.f32 	%f3, [update_theta_and_z_param_7];
-	mov.u32 	%r1, %ctaid.x;
-	mov.u32 	%r2, %tid.x;
-	or.b32  	%r10, %r2, %r1;
-	setp.ne.s32 	%p1, %r10, 0;
-	@%p1 bra 	$L__BB4_2;
-
-	cvta.to.global.u64 	%rd7, %rd3;
-	mul.wide.s32 	%rd8, %r8, 4;
-	add.s64 	%rd9, %rd7, %rd8;
-	cvt.rn.f32.s32 	%f4, %r9;
-	cvta.to.global.u64 	%rd10, %rd6;
-	ld.global.f32 	%f5, [%rd10];
-	div.rn.f32 	%f6, %f5, %f4;
-	mul.f32 	%f7, %f6, %f2;
-	ld.global.f32 	%f8, [%rd9];
-	sub.f32 	%f9, %f8, %f7;
-	mul.f32 	%f10, %f2, %f3;
-	setp.gt.f32 	%p2, %f9, %f10;
-	sub.f32 	%f11, %f9, %f10;
-	neg.f32 	%f12, %f10;
-	setp.lt.f32 	%p3, %f9, %f12;
-	add.f32 	%f13, %f10, %f9;
-	selp.f32 	%f14, %f13, 0f00000000, %p3;
-	selp.f32 	%f15, %f11, %f14, %p2;
-	st.global.f32 	[%rd9], %f15;
-	sub.f32 	%f16, %f15, %f8;
-	st.shared.f32 	[_ZZ18update_theta_and_zE11delta_theta], %f16;
-
-$L__BB4_2:
-	bar.sync 	0;
-	mov.u32 	%r3, %ntid.x;
-	mad.lo.s32 	%r12, %r1, %r3, %r2;
-	ld.shared.f32 	%f1, [_ZZ18update_theta_and_zE11delta_theta];
-	setp.eq.f32 	%p4, %f1, 0f00000000;
-	setp.ge.s32 	%p5, %r12, %r9;
-	or.pred  	%p6, %p4, %p5;
-	@%p6 bra 	$L__BB4_5;
-
-	mov.u32 	%r11, %nctaid.x;
-	mul.lo.s32 	%r5, %r11, %r3;
-	cvta.to.global.u64 	%rd1, %rd4;
-	cvta.to.global.u64 	%rd2, %rd5;
-
-$L__BB4_4:
-	mul.wide.s32 	%rd11, %r12, 4;
-	add.s64 	%rd12, %rd2, %rd11;
-	ld.global.f32 	%f17, [%rd12];
-	add.s64 	%rd13, %rd1, %rd11;
-	ld.global.f32 	%f18, [%rd13];
-	fma.rn.f32 	%f19, %f17, %f1, %f18;
-	st.global.f32 	[%rd13], %f19;
-	add.s32 	%r12, %r12, %r5;
-	setp.lt.s32 	%p7, %r12, %r9;
-	@%p7 bra 	$L__BB4_4;
-
-$L__BB4_5:
 	ret;
 
 }
