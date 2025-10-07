@@ -1,148 +1,236 @@
 import streamlit as st
 import numpy as np
+import cupy as cp
 import pandas as pd
 import time
+import psutil
+import os
 from sklearn.model_selection import train_test_split
 from sklearn.datasets import make_classification, make_regression
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression as SklearnLogisticRegression
 from sklearn.linear_model import LinearRegression as SklearnLinearRegression
 from sklearn.metrics import accuracy_score, r2_score
+
 from rustymachine_api.models import LogisticRegression as RustyLogisticRegression
 from rustymachine_api.models import LinearRegression as RustyLinearRegression
 
-# --- Page Configuration ---
 st.set_page_config(
-    page_title="Rusty Machine // Final Presentation",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="Rusty Machine // Performance Benchmark",
+    layout="wide"
 )
 
-# --- Styling ---
 st.markdown("""
 <style>
-    .main .block-container { padding-top: 2rem; padding-bottom: 3rem; }
-    .stMetric {
-        border: 1px solid #444;
-        border-radius: 10px;
-        padding: 1rem;
-        background-color: #1E1E1E;
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
     }
-    .result-header {
-        font-size: 1.75rem;
-        font-weight: bold;
-        color: #00A0B0;
+    .title {
+        font-family: 'monospace', sans-serif;
+        color: #FFFFFF;
         text-align: center;
-        margin-bottom: 1rem;
+        padding: 1rem;
+    }
+    .metric-card {
+        background-color: #1E1E1E;
+        border-radius: 10px;
+        padding: 1.5rem;
+        margin: 0.5rem;
+        border: 1px solid #444444;
+        text-align: center;
+    }
+    .metric-card h3 {
+        color: #00A0B0;
+        margin-bottom: 0.5rem;
+    }
+    .metric-card p {
+        font-size: 2.5rem;
+        color: #FFFFFF;
+        font-weight: bold;
+        margin: 0;
+    }
+    h1, h2, h3 {
+        color: #CCCCCC;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# --- Training Functions ---
-@st.cache_data
-def run_benchmarks(model_type, n_samples, n_features):
-    # Generate data
-    if model_type == "Logistic Regression":
-        X, y = make_classification(n_samples=n_samples, n_features=n_features, n_informative=int(n_features*0.8), flip_y=0.05, random_state=42)
-        metric_name = "Accuracy"
-    else:
-        X, y = make_regression(n_samples=n_samples, n_features=n_features, n_informative=int(n_features*0.8), noise=25, random_state=42)
-        metric_name = "R² Score"
-    
-    X = X.astype(np.float32)
-    y = y.astype(np.float32)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+def format_bytes(byte_count):
+    if byte_count is None or byte_count == 0: return "0.00 B"
+    power = 1024
+    n = 0
+    power_labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB'}
+    while byte_count >= power and n < len(power_labels) - 1:
+        byte_count /= power
+        n += 1
+    return f"{byte_count:.2f} {power_labels[n]}"
 
-    # --- Train Rusty Machine ---
-    if model_type == "Logistic Regression":
-        model_rm = RustyLogisticRegression(epochs=100, lr=0.05, batch_size=512, random_state=42)
-    else:
-        model_rm = RustyLinearRegression()
-    
-    start_rm = time.time()
-    model_rm.fit(X_train_scaled, y_train)
-    duration_rm = time.time() - start_rm
-    preds_rm = model_rm.predict(X_test_scaled)
-    score_rm = accuracy_score(y_test, preds_rm) if model_type == "Logistic Regression" else r2_score(y_test, preds_rm)
+def train_rusty_model(model_type, X_train, y_train, epochs, lr, batch_size):
+    try:
+        if model_type == "Logistic Regression":
+            model = RustyLogisticRegression(epochs=epochs, lr=lr, batch_size=batch_size, random_state=42)
+        else:
+            model = RustyLinearRegression()
+        
+        # ✅ **THE FIX**: Pass NumPy arrays to the fit method as it now handles conversion.
+        X_np = np.asarray(X_train)
+        y_np = np.asarray(y_train)
 
-    # --- Train Scikit-learn ---
-    if model_type == "Logistic Regression":
-        model_sk = SklearnLogisticRegression(solver='saga', max_iter=100, tol=1e-3, random_state=42)
-    else:
-        model_sk = SklearnLinearRegression()
+        # Measure GPU memory usage by creating temporary CuPy arrays
+        gpu_mem_used = cp.asarray(X_np).nbytes + cp.asarray(y_np).nbytes
 
-    start_sk = time.time()
-    model_sk.fit(X_train_scaled, y_train)
-    duration_sk = time.time() - start_sk
-    preds_sk = model_sk.predict(X_test_scaled)
-    score_sk = accuracy_score(y_test, preds_sk) if model_type == "Logistic Regression" else r2_score(y_test, preds_sk)
-    
-    results = {
-        "metric_name": metric_name,
-        "rm_score": score_rm, "sk_score": score_sk,
-        "rm_duration": duration_rm, "sk_duration": duration_sk,
-    }
-    return results
+        start_time = time.time()
+        model.fit(X_np, y_np)
+        duration = time.time() - start_time
+        
+        return duration, model, gpu_mem_used
+    except Exception as e:
+        st.error(f"Error in Rusty Machine: {e}")
+        return -1, None, 0
 
-# --- UI Layout ---
-st.title("🚀 Rusty Machine: A High-Performance ML Library")
-st.markdown("A demonstration of GPU-accelerated machine learning with Rust and CUDA.")
+def train_sklearn_model(model_type, X_train, y_train, epochs):
+    try:
+        if model_type == "Logistic Regression":
+            model = SklearnLogisticRegression(max_iter=epochs, solver='saga', tol=1e-3, random_state=42)
+        else:
+            model = SklearnLinearRegression()
+        
+        cpu_mem_used = X_train.nbytes + y_train.nbytes
+
+        start_time = time.time()
+        model.fit(X_train, y_train.ravel())
+        duration = time.time() - start_time
+        
+        return duration, model, cpu_mem_used
+    except Exception as e:
+        st.error(f"Error in Scikit-learn: {e}")
+        return -1, None, 0
+
+st.markdown('<h1 class="title">Rusty Machine // Performance Benchmark</h1>', unsafe_allow_html=True)
+st.markdown("<h3 style='text-align: center; color: #AAAAAA;'>An academic showcase of GPU-accelerated machine learning with Rust and CUDA.</h3>", unsafe_allow_html=True)
 st.markdown("---")
 
-# --- OFFICIAL BENCHMARK RESULTS (STATIC) ---
-st.header("🏆 Official Benchmark Results")
-st.markdown("The following results were achieved by running the full-scale benchmark on a large dataset, demonstrating the significant performance gains of the `rusty-machine` library.")
-
-st.subheader("Linear Regression (1,000,000 Samples)")
-col1, col2, col3 = st.columns(3)
-col1.metric("Rusty Machine Time", "0.978s", delta="-73.5%", delta_color="inverse")
-col2.metric("Scikit-learn Time", "3.927s")
-col3.metric("Performance Gain", "4.01x")
-st.metric("Model R² Score", "0.9979 (Identical for both models)")
-
-
-st.subheader("Logistic Regression (500,000 Samples)")
-col1, col2, col3 = st.columns(3)
-col1.metric("Rusty Machine Time", "0.517s", delta="-92.1%", delta_color="inverse")
-col2.metric("Scikit-learn Time", "6.515s")
-col3.metric("Performance Gain", "12.61x")
-st.metric("Model Accuracy", "0.794 (Identical for both models)")
-st.markdown("---")
-
-
-# --- LIVE DEMO SECTION ---
-st.header("⚙️ Live Demonstration")
-st.info("Run a smaller, live benchmark to see the system in action. Due to resource constraints in live demos, dataset sizes are limited.")
-
-with st.form("live_demo"):
-    model_type_live = st.selectbox("Select Model Type", ("Logistic Regression", "Linear Regression"))
+with st.sidebar:
+    st.header("Benchmark Configuration")
     
-    if model_type_live == "Logistic Regression":
-        # Use smaller, safer values for the live demo
-        n_samples_live = st.slider("Samples (Live Demo)", 5_000, 50_000, 20_000, 5_000)
-        n_features_live = st.slider("Features (Live Demo)", 10, 50, 20, 5)
+    model_type = st.selectbox(
+        "Select Model Type",
+        ("Logistic Regression", "Linear Regression")
+    )
+    
+    if model_type == "Logistic Regression":
+        default_samples, default_features = 500000, 100
     else:
-        n_samples_live = st.slider("Samples (Live Demo)", 10_000, 100_000, 50_000, 10_000)
-        n_features_live = st.slider("Features (Live Demo)", 10, 50, 20, 5)
-
-    submitted = st.form_submit_button("Run Live Benchmark", use_container_width=True, type="primary")
-
-if submitted:
-    st.markdown("<p class='result-header'>Live Benchmark Results</p>", unsafe_allow_html=True)
-    with st.spinner(f"Running live benchmark for {model_type_live}..."):
-        results = run_benchmarks(model_type_live, n_samples_live, n_features_live)
+        default_samples, default_features = 1000000, 100
     
-    st.subheader("Performance Comparison")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Rusty Machine Time", f"{results['rm_duration']:.3f}s")
-    col2.metric("Scikit-learn Time", f"{results['sk_duration']:.3f}s")
-    col3.metric("Performance Gain", f"{results['sk_duration']/results['rm_duration']:.2f}x")
+    n_samples = st.slider(
+        "Dataset Samples",
+        min_value=10000, max_value=1000000, value=default_samples, step=10000
+    )
     
-    st.subheader("Accuracy Comparison")
+    n_features = st.slider(
+        "Dataset Features",
+        min_value=10, max_value=200, value=default_features, step=10
+    )
+
+    if model_type == "Logistic Regression":
+        st.subheader("Hyperparameters")
+        epochs = st.slider("Epochs", 50, 500, 200, 10)
+        learning_rate = st.slider("Learning Rate", 0.001, 0.1, 0.05, 0.001, format="%.3f")
+        batch_size = st.select_slider("Batch Size", [128, 256, 512, 1024, 2048], 1024)
+    else:
+        epochs, learning_rate, batch_size = 0, 0, 0
+    
+    run_button = st.button("Initiate Benchmark", use_container_width=True, type="primary")
+
+if not run_button:
+    st.info("Configure the benchmark in the sidebar and click 'Initiate Benchmark'.")
+
+if run_button:
+    with st.spinner(f"Generating data for {model_type}..."):
+        if model_type == "Logistic Regression":
+            X, y = make_classification(n_samples=n_samples, n_features=n_features, n_informative=int(n_features*0.8), random_state=42)
+        else:
+            X, y = make_regression(n_samples=n_samples, n_features=n_features, n_informative=int(n_features*0.8), noise=25, random_state=42)
+
+        X = X.astype(np.float32)
+        y = y.astype(np.float32)
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+    st.success(f"Dataset generated with {n_samples:,} samples and {n_features} features.")
+    st.markdown("---")
+
+    st.header("Benchmark in Progress...")
     col1, col2 = st.columns(2)
-    col1.metric(f"Rusty Machine {results['metric_name']}", f"{results['rm_score']:.4f}")
-    col2.metric(f"Scikit-learn {results['metric_name']}", f"{results['sk_score']:.4f}")
+
+    with col1:
+        st.subheader("Rusty Machine (GPU)")
+        with st.spinner("Training..."):
+            rusty_duration, rusty_model, gpu_mem = train_rusty_model(model_type, X_train_scaled, y_train, epochs, learning_rate, batch_size)
+        st.success(f"Completed in {rusty_duration:.4f}s")
+    
+    with col2:
+        st.subheader("Scikit-learn (CPU)")
+        with st.spinner("Training..."):
+            sklearn_duration, sklearn_model, cpu_mem = train_sklearn_model(model_type, X_train_scaled, y_train, epochs)
+        st.success(f"Completed in {sklearn_duration:.4f}s")
+
+    st.markdown("---")
+    
+    st.header("Final Results")
+    
+    if rusty_model and sklearn_model:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(f'<div class="metric-card"><h3>Rusty Machine Time</h3><p>{rusty_duration:.3f}s</p></div>', unsafe_allow_html=True)
+        with col2:
+            st.markdown(f'<div class="metric-card"><h3>Scikit-learn Time</h3><p>{sklearn_duration:.3f}s</p></div>', unsafe_allow_html=True)
+        with col3:
+            speedup = sklearn_duration / rusty_duration if rusty_duration > 0 else 0
+            st.markdown(f'<div class="metric-card"><h3>Performance Gain</h3><p>{speedup:.2f}x</p></div>', unsafe_allow_html=True)
+        
+        st.markdown("### Model Performance Comparison")
+        if model_type == "Logistic Regression":
+            rusty_preds = rusty_model.predict(X_test_scaled)
+            sklearn_preds = sklearn_model.predict(X_test_scaled)
+            rusty_score = accuracy_score(y_test, rusty_preds)
+            sklearn_score = accuracy_score(y_test, sklearn_preds)
+            metric_name = "Accuracy"
+        else:
+            rusty_preds = rusty_model.predict(X_test_scaled)
+            sklearn_preds = sklearn_model.predict(X_test_scaled)
+            rusty_score = r2_score(y_test, rusty_preds)
+            sklearn_score = r2_score(y_test, sklearn_preds)
+            metric_name = "R² Score"
+
+        score_data = {
+            'Model': ['Rusty Machine (GPU)', 'Scikit-learn (CPU)'],
+            metric_name: [f"{rusty_score:.4f}", f"{sklearn_score:.4f}"]
+        }
+        score_df = pd.DataFrame(score_data)
+        st.table(score_df)
+
+        st.markdown("### Resource Usage Comparison")
+        mem_data = {
+            'Model': ['Rusty Machine (GPU)', 'Scikit-learn (CPU)'],
+            'Memory (Data)': [format_bytes(gpu_mem), format_bytes(cpu_mem)]
+        }
+        mem_df = pd.DataFrame(mem_data)
+        st.table(mem_df)
+
+        st.markdown("### Prediction Comparison (First 5 Samples)")
+        pred_data = {
+            'Feature 1': X_test_scaled[:5, 0],
+            'Feature 2': X_test_scaled[:5, 1],
+            'Feature 3': X_test_scaled[:5, 2],
+            'Rusty Machine': rusty_preds.flatten()[:5],
+            'Scikit-learn': sklearn_preds.flatten()[:5],
+        }
+        pred_df = pd.DataFrame(pred_data).round(2)
+        st.table(pred_df)
